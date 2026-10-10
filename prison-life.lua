@@ -1,6 +1,5 @@
 -- PrisonHub v2.9 | WindUI | Cuộc Sống Trong Nhà Tù
--- Refactored & Fully Populated Tabs
-
+-- Additions: Teleport, Aimlock, FOV Circle, Auto-Shoot (hostile logic + trespassing toggle), Auto-Invisible <35HP
 local CONFIG = {
     Title = "PrisonHub", Author = "vxmpingz_", Folder = "PrisonHub",
     ExpectedPlaceId = 155615604, StatsInterval = 1, KillLogSize = 50, KillLogShown = 12,
@@ -15,13 +14,13 @@ local CONFIG = {
 
 if getgenv and getgenv().PrisonHubUnload then pcall(getgenv().PrisonHubUnload) end
 
-local Players        = game:GetService("Players")
-local Teams          = game:GetService("Teams")
-local RunService     = game:GetService("RunService")
-local Lighting       = game:GetService("Lighting")
-local Stats          = game:GetService("Stats")
+local Players       = game:GetService("Players")
+local Teams         = game:GetService("Teams")
+local RunService    = game:GetService("RunService")
+local Lighting      = game:GetService("Lighting")
+local Stats         = game:GetService("Stats")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualUser    = game:GetService("VirtualUser")
+local VirtualUser   = game:GetService("VirtualUser")
 local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
@@ -56,6 +55,7 @@ local function safe(label, fn, ...)
     if not ok then log("ERROR", label .. ": " .. tostring(result)) return nil end
     return result
 end
+local function divider(tab) pcall(function() tab:Divider() end) end
 local function track(conn) connections[#connections+1] = conn return conn end
 
 local WindUI = safe("load WindUI", function() return loadstring(game:HttpGet(CONFIG.WindUIUrl))() end)
@@ -86,26 +86,22 @@ local API = {
 if getgenv then getgenv().PrisonHubAPI = API end
 
 -- ===== OVERVIEW =====
-local overview = OverviewTab:Paragraph({ Title="Server Info", Desc="Collecting statistics..." })
+local overview = OverviewTab:Paragraph({ Title="Server", Desc="Collecting..." })
 local frames, acc, fps = 0, 0, 0
 track(RunService.RenderStepped:Connect(function(dt)
     frames += 1; acc += dt
     if acc >= 1 then fps = math.floor(frames/acc+0.5); frames, acc = 0, 0 end
 end))
-
 local function getPing()
     local net = Stats:FindFirstChild("Network")
     local item = net and net:FindFirstChild("ServerStatsItem")
     local dp = item and item:FindFirstChild("Data Ping")
     return dp and math.floor(dp:GetValue()) or -1
 end
-
 local function fmtTime(s) return string.format("%02d:%02d:%02d", s//3600, (s%3600)//60, s%60) end
-
 OverviewTab:Button({ Title="Copy Job ID", Callback=function()
     if setclipboard then safe("copy", setclipboard, game.JobId); notify("Copied", game.JobId) else notify("Unsupported","setclipboard unavailable") end
 end })
-
 OverviewTab:Button({ Title="Reset Character", Desc="Kills your character and respawns", Callback=function()
     safe("reset", function()
         local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
@@ -114,7 +110,12 @@ OverviewTab:Button({ Title="Reset Character", Desc="Kills your character and res
 end })
 
 -- ===== HOSTILE DETECTION =====
-local GUARD_ZONE = { xMin=650, xMax=900, zMin=2250, zMax=2380 }
+-- Team hostile logic (verified from game):
+--   Guards     → hostile to: Criminals, Inmates (in restricted zone counted as trespassing)
+--   Criminals  → hostile to: Guards
+--   Inmates    → not hostile by default; may trespass
+-- "Trespassing Inmate" = Inmate detected inside Guards-only zone (X < 850, Z < 2350 roughly)
+local GUARD_ZONE = { xMin=650, xMax=900, zMin=2250, zMax=2380 } -- Guards base approximate zone
 
 local function isInGuardZone(char)
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -138,7 +139,7 @@ local function isHostileToMe(p)
 end
 
 local function isTrespassingInmate(p)
-    return p.Team and p.Team.Name == "Inmates" and p.Character and isInGuardZone(p.Character)
+    return p.Team and p.Team.Name == "Inmates" and p.Character and p.Character:GetAttribute("Trespassing") == true
 end
 
 local function shouldAutoShoot(p)
@@ -185,11 +186,11 @@ CombatTab:Toggle({ Title="Kill Aura", Desc="Auto melee on players in range (mele
         end
     end))
 end })
-
 CombatTab:Slider({ Title="Kill Aura Range", Step=1, Value={ Min=5, Max=60, Default=CONFIG.KillAuraRange }, Callback=function(v) CONFIG.KillAuraRange = v end })
 
--- ===== AUTO SHOOT =====
-CombatTab:Paragraph({ Title="Auto Shoot", Desc="Tự động bắn dựa theo team (ShootEvent). Hostile = enemy theo team logic." })
+-- ===== AUTO SHOOT (ShootEvent-based) =====
+divider(CombatTab)
+CombatTab:Paragraph({ Title="Auto Shoot", Desc="Tự động bắn dựa theo team (ShootEvent). Hostile = enemy theo team logic. Trespassing = Inmate vào zone Guards." })
 
 local function getClosestHostile()
     local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
@@ -209,7 +210,7 @@ local function getClosestHostile()
     return closest, closestHRP
 end
 
-CombatTab:Toggle({ Title="Auto Shoot (Hostile)", Desc="Tự động bắn Guards/Criminals/Inmates", Default=false, Callback=function(v)
+CombatTab:Toggle({ Title="Auto Shoot (Hostile)", Desc="Tự động bắn Guards/Criminals/Inmates (theo team bạn đang ở)", Default=false, Callback=function(v)
     state.autoShoot = v
     if autoShootConn then autoShootConn:Disconnect(); autoShootConn = nil end
     if not v then return end
@@ -224,13 +225,14 @@ CombatTab:Toggle({ Title="Auto Shoot (Hostile)", Desc="Tự động bắn Guards
         if not target or not hrp then return end
         local aimPart = target.Character:FindFirstChild("Head") or hrp
         local origin = (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")).Position
+        -- format xác nhận bằng remote-spy: FireServer({ {origin, hitPos, hitPart} })
         safe("autoshoot", function()
             shootEvent:FireServer({ { origin, aimPart.Position, aimPart } })
         end)
     end))
 end })
 
-CombatTab:Toggle({ Title="Bắn Trespassing Prisoner", Desc="Tự động bắn Inmates vào zone Guards", Default=false, Callback=function(v)
+CombatTab:Toggle({ Title="Bắn Trespassing Prisoner", Desc="Bật thêm: tự động bắn Inmates đang vào zone Guards (mặc định tắt)", Default=false, Callback=function(v)
     state.autoShootTrespassing = v
 end })
 
@@ -249,12 +251,10 @@ local function mentionsMe(...)
     end
     return not sawInstance
 end
-
 track(RunService.Heartbeat:Connect(function()
     local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
     if hum and hum.WalkSpeed > 0.5 and os.clock() > taseUntil then walkBaseline = hum.WalkSpeed end
 end))
-
 if taseRemote then
     track(taseRemote.OnClientEvent:Connect(function(...)
         if state.antiTaser and mentionsMe(...) then
@@ -263,7 +263,6 @@ if taseRemote then
         end
     end))
 end
-
 track(RunService.Stepped:Connect(function()
     if not state.antiTaser or os.clock() > taseUntil then return end
     local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
@@ -271,15 +270,15 @@ track(RunService.Stepped:Connect(function()
     if hum.WalkSpeed < walkBaseline then hum.WalkSpeed = walkBaseline end
     if hum.PlatformStand and not state.fly then hum.PlatformStand = false end
 end))
-
 CombatTab:Toggle({ Title="Anti Taser", Desc="Bị Taser bắn thì giữ lại WalkSpeed", Default=false, Callback=function(v)
     state.antiTaser = v
     if not v then taseUntil = 0 end
 end })
 
 -- ===== AUTO INVISIBLE < 35 HP =====
+divider(CombatTab)
 local autoInvisFired = false
-CombatTab:Toggle({ Title="Auto Invisible (dưới 35 HP)", Desc="Tự động bật Invisible khi HP ≤ 35", Default=false, Callback=function(v)
+CombatTab:Toggle({ Title="Auto Invisible (dưới 35 HP)", Desc="Tự động bật Invisible khi HP ≤ 35, tự tắt khi full HP", Default=false, Callback=function(v)
     state.autoInvis = v
     if autoInvisConn then autoInvisConn:Disconnect(); autoInvisConn = nil end
     if not v then autoInvisFired = false return end
@@ -310,7 +309,6 @@ local AIMLOCK_FOV = 80
 local function destroyFOVCircle()
     if fovCircle then fovCircle:Remove(); fovCircle = nil end
 end
-
 local function createFOVCircle()
     destroyFOVCircle()
     if not Drawing then return end
@@ -328,7 +326,6 @@ AimTab:Toggle({ Title="FOV Circle", Desc="Hiển thị vòng tròn FOV aimlock t
     state.fovCircle = v
     if v then createFOVCircle() else destroyFOVCircle() end
 end })
-
 AimTab:Slider({ Title="FOV Radius", Step=5, Value={ Min=20, Max=250, Default=AIMLOCK_FOV }, Callback=function(v)
     AIMLOCK_FOV = v
     if fovCircle then fovCircle.Radius = v end
@@ -338,10 +335,9 @@ local function getAimlockTarget()
     local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not myHRP then return nil end
     local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
-    local best, bestDist = nil, AIMLOCK_FOV
+    local best, bestDist = nil, CONFIG.AimlockRange
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer and p.Character then
-            if state.aimlockHostileOnly and not isHostileToMe(p) then continue end
             local hum = p.Character:FindFirstChildOfClass("Humanoid")
             local head = p.Character:FindFirstChild("Head")
             if hum and hum.Health > 0 and head then
@@ -370,16 +366,43 @@ AimTab:Toggle({ Title="Aimlock", Desc="Khóa aim vào đầu target gần nhất
         local cf = Camera.CFrame
         local targetCF = CFrame.new(cf.Position, head.Position)
         Camera.CFrame = cf:Lerp(targetCF, CONFIG.AimlockSmoothing)
+        -- update fov circle position
         if fovCircle then
             fovCircle.Position = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
         end
     end))
 end })
-
 AimTab:Slider({ Title="Aimlock Smoothing", Desc="0.1=mượt, 1.0=snap ngay", Step=0.05, Value={ Min=0.05, Max=1.0, Default=CONFIG.AimlockSmoothing }, Callback=function(v) CONFIG.AimlockSmoothing = v end })
 AimTab:Toggle({ Title="Aimlock chỉ Hostile", Desc="Bật = chỉ lock hostile; Tắt = lock tất cả player", Default=false, Callback=function(v)
+    -- stored in state for getAimlockTarget to check
     state.aimlockHostileOnly = v
 end })
+
+-- override getAimlockTarget to respect hostile filter
+local _baseGetAimlockTarget = getAimlockTarget
+getAimlockTarget = function()
+    local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return nil end
+    local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+    local best, bestDist = nil, AIMLOCK_FOV
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            if state.aimlockHostileOnly and not isHostileToMe(p) then continue end
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            local head = p.Character:FindFirstChild("Head")
+            if hum and hum.Health > 0 and head then
+                local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+                if onScreen then
+                    local dist2D = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+                    if dist2D < AIMLOCK_FOV and dist2D < bestDist then
+                        best = p; bestDist = dist2D
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
 
 -- ===== TELEPORT =====
 local TELEPORT_LOCATIONS = {
@@ -403,21 +426,21 @@ local function teleportTo(pos)
     notify("📍 Teleport", "Đã tới " .. tostring(pos))
 end
 
-TeleportTab:Paragraph({ Title="Teleport nhanh", Desc="Dịch chuyển tới các khu vực chính trong game." })
+TeleportTab:Paragraph({ Title="Teleport nhanh", Desc="Dịch chuyển tới các khu vực chính trong game. Nếu đang Hover/Fly thì Y tự cập nhật." })
 for _, loc in ipairs(TELEPORT_LOCATIONS) do
     TeleportTab:Button({ Title=loc.name, Callback=function() teleportTo(loc.pos) end })
 end
-
+divider(TeleportTab)
 TeleportTab:Button({ Title="Teleport tới Target Aimlock", Desc="Tp ngay tới player đang bị aimlock lock", Callback=function()
     if aimlockTarget and aimlockTarget.Character then
         local hrp2 = aimlockTarget.Character:FindFirstChild("HumanoidRootPart")
-        if hrp2 then teleportTo(hrp2.Position) end
+        if hrp2 then teleportTo(hrp2.Position + Vector3.new(0,3,0)) end
     else
-        notify("Teleport","Chưa có aimlock target")
+        notify("Teleport","Chưa có aimlock target") 
     end
 end })
-
-TeleportTab:Button({ Title="Teleport tới Player gần nhất", Callback=function()
+TeleportTab:Button({ Title="Teleport tới Player...", Desc="Nhập tên rồi tp", Callback=function()
+    -- fallback: tp tới người gần nhất
     local myHRP = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     if not myHRP then return end
     local closest, closestDist = nil, math.huge
@@ -432,7 +455,7 @@ TeleportTab:Button({ Title="Teleport tới Player gần nhất", Callback=functi
     end
     if closest then
         local hrp2 = closest.Character:FindFirstChild("HumanoidRootPart")
-        if hrp2 then teleportTo(hrp2.Position); notify("Teleport","→ "..closest.Name) end
+        if hrp2 then teleportTo(hrp2.Position + Vector3.new(0,3,0)); notify("Teleport","→ "..closest.Name) end
     end
 end })
 
@@ -448,13 +471,12 @@ local function collectInvisParts()
         end
     end
 end
-
 local function applyInvisTransparency(v)
     for _, part in ipairs(invisParts) do
         if part.Parent then part.Transparency = v and CONFIG.InvisTransparency or 0 end
     end
 end
-
+-- forward declare so auto-invis toggle above can reference it
 setInvisible = function(v)
     state.invisible = v
     if invisConn then invisConn:Disconnect(); invisConn = nil end
@@ -484,8 +506,7 @@ setInvisible = function(v)
         applyInvisTransparency(false)
     end
 end
-
-MovementTab:Toggle({ Title="Invisible", Desc="Server thấy bạn dưới lòng đất", Default=false, Callback=function(v)
+MovementTab:Toggle({ Title="Invisible", Desc="Server thấy bạn dưới lòng đất; màn hình hiện ghost", Default=false, Callback=function(v)
     safe("invisible", setInvisible, v)
 end })
 
@@ -497,7 +518,6 @@ local function stopFly()
     local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
     if hum then hum.PlatformStand = false end
 end
-
 local function startFly()
     stopFly()
     local char = LocalPlayer.Character
@@ -525,8 +545,7 @@ local function startFly()
         if flat.Magnitude > 0.01 then flyBG.CFrame = CFrame.new(root.Position, root.Position + flat) end
     end))
 end
-
-MovementTab:Toggle({ Title="Fly", Desc="WASD/joystick = bay theo camera. Space = lên, Ctrl = xuống", Default=false, Callback=function(v)
+MovementTab:Toggle({ Title="Fly", Desc="WASD/joystick = bay theo camera. Jump/Space = lên, Ctrl = xuống", Default=false, Callback=function(v)
     state.fly = v
     if v then startFly() else stopFly() end
 end })
@@ -548,13 +567,11 @@ local function noclipOff()
     end
     noclipSaved = {}
 end
-
 local function stopHover()
     if hoverConn then hoverConn:Disconnect(); hoverConn = nil end
     if hoverBV   then hoverBV:Destroy();      hoverBV = nil end
     hoverTargetY = nil
 end
-
 local function startHover()
     stopHover()
     local char = LocalPlayer.Character
@@ -577,7 +594,6 @@ local function startHover()
         hoverBV.Velocity = Vector3.new(md.X * h.WalkSpeed, vy, md.Z * h.WalkSpeed)
     end))
 end
-
 local function startNoclipLoop()
     noclipConn = track(RunService.Stepped:Connect(function()
         local char = LocalPlayer.Character
@@ -591,7 +607,6 @@ local function startNoclipLoop()
         end
     end))
 end
-
 local function setNoclipMode(mode)
     if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
     stopHover(); noclipOff()
@@ -602,7 +617,6 @@ local function setNoclipMode(mode)
         if mode == "hover" then startHover() end
     end
 end
-
 local function forceOff(toggle)
     noclipSuppress = true
     pcall(function()
@@ -611,22 +625,136 @@ local function forceOff(toggle)
     end)
     task.delay(0.3, function() noclipSuppress = false end)
 end
-
 voidToggle = MovementTab:Toggle({ Title="Noclip (fall to Void)", Desc="Xuyên mọi thứ kể cả sàn", Default=false, Callback=function(v)
     if noclipSuppress then return end
     if v then forceOff(hoverToggle); setNoclipMode("void")
     elseif noclipMode == "void" then setNoclipMode(nil) end
 end })
-
-hoverToggle = MovementTab:Toggle({ Title="Noclip (no fall)", Desc="Xuyên tường, không rơi.", Default=false, Callback=function(v)
+hoverToggle = MovementTab:Toggle({ Title="Noclip (no fall)", Desc="Xuyên tường, không rơi. Space=lên, Ctrl=xuống", Default=false, Callback=function(v)
     if noclipSuppress then return end
     if v then forceOff(voidToggle); setNoclipMode("hover")
     elseif noclipMode == "hover" then setNoclipMode(nil) end
 end })
-
 MovementTab:Slider({ Title="Hover Speed", Step=5, Value={ Min=10, Max=100, Default=hoverSpeed }, Callback=function(v) hoverSpeed = v end })
 MovementTab:Button({ Title="Hover Up +5",   Callback=function() if hoverTargetY then hoverTargetY += 5 end end })
 MovementTab:Button({ Title="Hover Down -5", Callback=function() if hoverTargetY then hoverTargetY -= 5 end end })
+
+-- ===== AUTO ARREST (Guards + Handcuffs) =====
+local arrestRemote = Remotes and Remotes:FindFirstChild("ArrestPlayer")
+local arrestCfg = { radius=100, interval=0.4, cooldown=2.5, criminals=true, trespass=true, hostile=true, tp=true }
+local arrestConn, arrestBusy, arrestedAt = nil, false, {}
+state.autoArrest = false
+local function wantArrest(p)
+    if p == LocalPlayer or not p.Team or not p.Character then return false end
+    local hum = p.Character:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    local t = p.Team.Name
+    if t == "Criminals" then return arrestCfg.criminals end
+    if t == "Inmates" then
+        if arrestCfg.trespass and p.Character:GetAttribute("Trespassing") == true then return true end
+        if arrestCfg.hostile and p.Character:GetAttribute("Hostile") == true then return true end
+    end
+    return false
+end
+local function getCuffs()
+    local c = LocalPlayer.Character
+    if not c then return nil end
+    for _, box in ipairs({ c, LocalPlayer.Backpack }) do
+        local t = box:FindFirstChild("Handcuffs")
+        if t and t:IsA("Tool") then return t end
+    end
+end
+divider(CombatTab)
+CombatTab:Toggle({ Title="Auto Arrest (Guards)", Desc="Guards tự bắt Criminals / Hostile / Trespassing Inmates bằng Handcuffs", Default=false, Callback=function(v)
+    state.autoArrest = v
+    if arrestConn then arrestConn:Disconnect(); arrestConn = nil end
+    if not v then return end
+    if not arrestRemote then notify("Auto Arrest", "Không thấy ArrestPlayer") return end
+    local last = 0
+    arrestConn = track(RunService.Heartbeat:Connect(function()
+        if arrestBusy or os.clock() - last < arrestCfg.interval then return end
+        last = os.clock()
+        if not (LocalPlayer.Team and LocalPlayer.Team.Name == "Guards") then return end
+        local char = LocalPlayer.Character
+        local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not myHRP or not hum or hum.Health <= 0 then return end
+        local best, bestHRP, bestD = nil, nil, arrestCfg.radius
+        for _, p in ipairs(Players:GetPlayers()) do
+            if wantArrest(p) and (not arrestedAt[p] or os.clock() - arrestedAt[p] > arrestCfg.cooldown) then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local d = (hrp.Position - myHRP.Position).Magnitude
+                    if d <= bestD then best, bestHRP, bestD = p, hrp, d end
+                end
+            end
+        end
+        if not best then return end
+        local cuffs = getCuffs()
+        if not cuffs then return end
+        arrestBusy = true
+        task.spawn(function()
+            pcall(function()
+                if cuffs.Parent ~= char then hum:EquipTool(cuffs); task.wait(0.15) end
+                local home
+                if arrestCfg.tp then
+                    home = myHRP.CFrame
+                    myHRP.CFrame = bestHRP.CFrame * CFrame.new(0, 0, 3)
+                    task.wait(0.2)
+                end
+                arrestedAt[best] = os.clock()
+                arrestRemote:InvokeServer(best, 1)
+                task.wait(0.1)
+                if home and myHRP.Parent then myHRP.CFrame = home end
+            end)
+            arrestBusy = false
+        end)
+    end))
+end })
+CombatTab:Slider({ Title="Phạm vi quét target (stud)", Step=5, Value={ Min=5, Max=500, Default=arrestCfg.radius }, Callback=function(v) arrestCfg.radius = v end })
+CombatTab:Toggle({ Title="Bắt Criminals", Default=true, Callback=function(v) arrestCfg.criminals = v end })
+CombatTab:Toggle({ Title="Bắt Trespassing Inmates", Default=true, Callback=function(v) arrestCfg.trespass = v end })
+CombatTab:Toggle({ Title="Bắt Hostile Inmates", Default=true, Callback=function(v) arrestCfg.hostile = v end })
+CombatTab:Toggle({ Title="Teleport tới target để bắt", Desc="Tắt = chỉ bắt khi target đã ở gần bạn", Default=true, Callback=function(v) arrestCfg.tp = v end })
+
+-- ===== SPIN BOT + BUNNY HOP =====
+local spinSpeed, spinConn, bhopConn = 720, nil, nil
+state.spin, state.bhop = false, false
+local function getHum() local c = LocalPlayer.Character return c and c:FindFirstChildOfClass("Humanoid") end
+local function stopSpin()
+    if spinConn then spinConn:Disconnect(); spinConn = nil end
+    local h = getHum(); if h then h.AutoRotate = true end
+end
+local function stopBhop()
+    if bhopConn then bhopConn:Disconnect(); bhopConn = nil end
+end
+MovementTab:Toggle({ Title="Spin Bot", Desc="Xoay nhân vật liên tục (server thấy bạn xoay). Nên tắt Fly khi dùng", Default=false, Callback=function(v)
+    state.spin = v
+    stopSpin()
+    if not v then return end
+    spinConn = track(RunService.Heartbeat:Connect(function(dt)
+        local c = LocalPlayer.Character
+        local hrp = c and c:FindFirstChild("HumanoidRootPart")
+        local h = c and c:FindFirstChildOfClass("Humanoid")
+        if not hrp or not h or h.Health <= 0 then return end
+        h.AutoRotate = false
+        hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(spinSpeed) * dt, 0)
+    end))
+end })
+MovementTab:Slider({ Title="Spin Speed (độ/giây)", Step=30, Value={ Min=60, Max=3600, Default=spinSpeed }, Callback=function(v) spinSpeed = v end })
+MovementTab:Toggle({ Title="Bunny Hop", Desc="Tự nhảy liên tục khi đang di chuyển", Default=false, Callback=function(v)
+    state.bhop = v
+    stopBhop()
+    if not v then return end
+    bhopConn = track(RunService.Heartbeat:Connect(function()
+        local h = getHum()
+        if not h or h.Health <= 0 or state.fly then return end
+        if h.MoveDirection.Magnitude > 0 and h.FloorMaterial ~= Enum.Material.Air then
+            h:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end))
+end })
+API.cleanupMisc = function() stopSpin(); stopBhop() end
 
 track(LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.6)
@@ -642,21 +770,17 @@ local MELEES = { "Crude Knife", "Hammer" }
 local isFood, isMelee = {}, {}
 for _, n in ipairs(FOODS)  do isFood[n]  = true end
 for _, n in ipairs(MELEES) do isMelee[n] = true end
-
 local function getGiver()
     local items = workspace:FindFirstChild("Prison_ITEMS")
     return items and items:FindFirstChild("giver")
 end
-
 local function hasTool(name)
     local c = LocalPlayer.Character
     return LocalPlayer.Backpack:FindFirstChild(name) or (c and c:FindFirstChild(name))
 end
-
 local function anchorPart(model)
     return model:FindFirstChild("ITEMPICKUP",true) or model:FindFirstChild("Mesh") or model:FindFirstChildWhichIsA("BasePart",true)
 end
-
 local function findCandidates(name)
     local list = {}
     local giver = getGiver()
@@ -674,7 +798,6 @@ local function findCandidates(name)
     table.sort(list, function(a,b) return score(a) < score(b) end)
     return list
 end
-
 local function pickupByName(name)
     if not pickupRemote and not giverRemote then return false, "Không thấy remote nhặt đồ" end
     if hasTool(name) then return true, "Đã có " .. name end
@@ -710,35 +833,25 @@ local function pickupByName(name)
     end
     return finish(false, lastMsg)
 end
-
 local function doPickup(name) task.spawn(function() local ok,msg=pickupByName(name); notify(ok and("✓ "..name) or("✗ "..name), msg) end) end
 local function pickupMany(names) task.spawn(function() for _,n in ipairs(names) do local ok,msg=pickupByName(n); notify(ok and("✓ "..n) or("✗ "..n), msg) end end) end
-
-PickupTab:Paragraph({ Title="Cách hoạt động", Desc="Tp tới item, gửi GiverPressed, rồi tp về." })
+PickupTab:Paragraph({ Title="Cách hoạt động", Desc="Tp tới item, gửi GiverPressed, rồi tp về. Thông báo ✓/✗ hiện kết quả." })
 for _, n in ipairs(FOODS)  do PickupTab:Button({ Title="Lấy "..n, Callback=function() doPickup(n) end }) end
 PickupTab:Button({ Title="Lấy tất cả đồ ăn", Callback=function() pickupMany(FOODS) end })
 for _, n in ipairs(MELEES) do PickupTab:Button({ Title="Lấy "..n, Callback=function() doPickup(n) end }) end
 PickupTab:Button({ Title="Lấy Crude Knife + Hammer", Callback=function() pickupMany(MELEES) end })
-
-local function renderGunButtons()
-    local gunNames, seen = {}, {}
+local gunNames, seen = {}, {}
+do
     local giver = getGiver()
     if giver then
         for _, m in ipairs(giver:GetChildren()) do
-            if not isFood[m.Name] and not isMelee[m.Name] and not seen[m.Name] then 
-                seen[m.Name] = true
-                gunNames[#gunNames+1] = m.Name 
-            end
+            if not isFood[m.Name] and not isMelee[m.Name] and not seen[m.Name] then seen[m.Name]=true; gunNames[#gunNames+1]=m.Name end
         end
         table.sort(gunNames)
     end
-    for _, n in ipairs(gunNames) do PickupTab:Button({ Title="Lấy "..n, Callback=function() doPickup(n) end }) end
-    if #gunNames > 0 then
-        PickupTab:Button({ Title="Lấy tất cả súng / đồ", Callback=function() pickupMany(gunNames) end })
-    end
 end
-renderGunButtons()
-PickupTab:Button({ Title="🔄 Dynamic Refresh Guns", Desc="Cập nhật lại danh sách súng trên map", Callback=function() renderGunButtons(); notify("Pickups", "Đã cập nhật danh sách súng") end })
+for _, n in ipairs(gunNames) do PickupTab:Button({ Title="Lấy "..n, Callback=function() doPickup(n) end }) end
+PickupTab:Button({ Title="Lấy tất cả súng / đồ", Callback=function() pickupMany(gunNames) end })
 
 -- ===== TEAM SWAP =====
 local TEAM_EDGES = {
@@ -747,9 +860,7 @@ local TEAM_EDGES = {
     Criminals= { "Neutral" },
     Inmates  = { "Criminals" },
 }
-
 local function curTeam() return LocalPlayer.Team and LocalPlayer.Team.Name end
-
 local function findRoute(from, to)
     if from == to then return {} end
     local queue, visited = { { from, {} } }, { [from]=true }
@@ -765,7 +876,6 @@ local function findRoute(from, to)
     end
     return nil
 end
-
 local function waitForTeam(name, timeout)
     local t0 = os.clock()
     while os.clock()-t0 < timeout do
@@ -774,7 +884,6 @@ local function waitForTeam(name, timeout)
     end
     return curTeam() == name
 end
-
 local function waitForCharacter(timeout)
     local t0 = os.clock()
     while os.clock()-t0 < timeout do
@@ -784,7 +893,6 @@ local function waitForCharacter(timeout)
     end
     return false
 end
-
 local function stepTeam(from, to)
     if from == "Inmates" and to == "Criminals" then
         local holder = workspace:FindFirstChild("Criminals Spawn",true)
@@ -812,7 +920,6 @@ local function stepTeam(from, to)
     local hint = (from=="Guards") and " (vừa vào Guards cần chờ ~8 giây)" or ((to=="Guards") and " (Guards có thể đã đầy)" or "")
     return false, "Server từ chối "..from.."→"..to..hint
 end
-
 local switching = false
 local function switchTeam(target)
     if switching then return false, "Đang đổi team, chờ chút" end
@@ -833,9 +940,8 @@ local function switchTeam(target)
     return true, (#route>1 and ("Đi qua "..#route.." bước: "..from.."→"..table.concat(route,"→")) or lastMsg)
 end
 API.switchTeam = switchTeam
-
 local teamStatus = TeamSwapTab:Paragraph({ Title="Team hiện tại", Desc="..." })
-TeamSwapTab:Paragraph({ Title="Luật đổi team", Desc="Neutral→Inmates/Guards, Guards→Neutral, Criminals→Neutral. Inmates→Criminals bằng Spawn." })
+TeamSwapTab:Paragraph({ Title="Luật đổi team", Desc="Neutral→Inmates/Guards, Guards→Neutral, Criminals→Neutral. Inmates→Criminals bằng Criminals Spawn. Vừa vào Guards chờ ~8 giây." })
 for _, t in ipairs({ "Neutral","Inmates","Guards","Criminals" }) do
     TeamSwapTab:Button({ Title="Đổi sang "..t, Callback=function()
         task.spawn(function()
@@ -856,7 +962,6 @@ local function removeESP(p)
     if objs then for _,o in ipairs(objs) do pcall(function() o:Destroy() end) end end
     espObjects[p] = nil
 end
-
 local function buildESP(p)
     if p == LocalPlayer then return end
     removeESP(p)
@@ -881,16 +986,13 @@ local function buildESP(p)
     end
     espObjects[p] = objs
 end
-
 local function refreshAllESP()
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer then if state.esp then buildESP(p) else removeESP(p) end end
     end
 end
-
 ESPTab:Toggle({ Title="ESP (Body)", Desc="Inmates=Cam, Criminals=Đỏ, Guards=Xanh", Default=false, Callback=function(v) state.esp=v; refreshAllESP() end })
 ESPTab:Toggle({ Title="Show Names", Desc="Hiện tên trên đầu nhân vật", Default=false, Callback=function(v) state.espNames=v; if state.esp then refreshAllESP() end end })
-
 local function hookPlayer(p)
     if p == LocalPlayer then return end
     track(p.CharacterAdded:Connect(function() task.wait(0.5); if state.esp then buildESP(p) end end))
@@ -907,7 +1009,6 @@ local function renderKills()
     for i = #killLog, math.max(1,#killLog-CONFIG.KillLogShown+1), -1 do lines[#lines+1] = killLog[i] end
     safe("render kills", function() killParagraph:SetDesc(#lines>0 and table.concat(lines,"\n") or "Waiting for kills...") end)
 end
-
 local killfeed = ReplicatedStorage:FindFirstChild("Killfeed")
 if killfeed then
     for _, e in ipairs(killfeed:GetChildren()) do killLog[#killLog+1] = e.Name end
@@ -917,22 +1018,15 @@ if killfeed then
         renderKills()
     end))
     renderKills()
-else killParagraph:SetDesc("Killfeed not found in ReplicatedStorage.") end
+else killParagraph:SetDesc("Killfeed not found.") end
 KillsTab:Button({ Title="Clear Log", Callback=function() killLog={}; renderKills() end })
 
 -- ===== TEAMS =====
 local rosterParagraphs = {}
-local function initRosterTab()
-    for _, t in ipairs(Teams:GetChildren()) do
-        if t:IsA("Team") and not rosterParagraphs[t] then
-            rosterParagraphs[t] = TeamsTab:Paragraph({ Title=t.Name, Desc="Loading players..." })
-        end
-    end
+for _, t in ipairs(Teams:GetChildren()) do
+    if t:IsA("Team") then rosterParagraphs[t] = TeamsTab:Paragraph({ Title=t.Name, Desc="..." }) end
 end
-initRosterTab()
-
 local function updateRoster()
-    initRosterTab()
     for t, para in pairs(rosterParagraphs) do
         local members, names = t:GetPlayers(), {}
         for i, plr in ipairs(members) do
@@ -952,7 +1046,6 @@ UtilTab:Toggle({ Title="Anti-AFK", Desc="Chống kick idle", Default=false, Call
         end))
     elseif afkConn then afkConn:Disconnect(); afkConn=nil end
 end })
-
 UtilTab:Toggle({ Title="Fullbright", Desc="Xóa bóng tối và sương mù", Default=false, Callback=function(v)
     safe("fullbright", function()
         if v then
@@ -964,36 +1057,17 @@ UtilTab:Toggle({ Title="Fullbright", Desc="Xóa bóng tối và sương mù", De
         end
     end)
 end })
-
 UtilTab:Slider({ Title="Field of View", Step=1, Value={ Min=40, Max=120, Default=originals.fov }, Callback=function(v) safe("fov", function() Camera.FieldOfView=v end) end })
 UtilTab:Toggle({ Title="Unlock Max Zoom", Default=false, Callback=function(v) safe("zoom", function() LocalPlayer.CameraMaxZoomDistance=v and 1000 or originals.zoom end) end })
 
 -- ===== SETTINGS =====
-SettingsTab:Paragraph({ Title="PrisonHub Config", Desc="Tùy chỉnh giao diện và quản lý phiên làm việc." })
-
-SettingsTab:Keybind({ Title="Toggle UI Keybind", Desc="Phím đóng/mở giao diện Hub", Default=Enum.KeyCode.RightShift, Callback=function()
-    if Window then Window:Toggle() end
-end })
-
-SettingsTab:Dropdown({ Title="UI Theme", Desc="Đổi chủ đề giao diện WindUI", Options={"Dark", "Light", "Rose", "Aqua"}, Default="Dark", Callback=function(theme)
-    if Window and Window.SetTheme then Window:SetTheme(theme) end
-end })
-
-SettingsTab:Button({ Title="Copy Script Raw Link", Callback=function()
-    if setclipboard then 
-        setclipboard("loadstring(game:HttpGet('https://raw.githubusercontent.com/Thaihdu21/prison-life-script/refs/heads/main/prison-life.lua'))()")
-        notify("Copied", "Đã sao chép đường dẫn Script!")
-    else 
-        notify("Error", "setclipboard không hỗ trợ") 
-    end
-end })
-
 local function unload()
     running = false
     state.esp = false; refreshAllESP()
     destroyFOVCircle()
     safe("unload invisible",  setInvisible,   false)
     stopFly()
+    if API.cleanupMisc then pcall(API.cleanupMisc) end
     safe("unload noclip", setNoclipMode, nil)
     if autoShootConn then autoShootConn:Disconnect(); autoShootConn=nil end
     if aimlockConn   then aimlockConn:Disconnect();   aimlockConn=nil end
@@ -1010,7 +1084,6 @@ local function unload()
     log("INFO","Unloaded")
 end
 if getgenv then getgenv().PrisonHubUnload = unload end
-
 SettingsTab:Button({ Title="Unload PrisonHub", Desc="Dọn sạch mọi thứ và đóng cửa sổ", Callback=unload })
 
 -- ===== MAIN LOOP =====
