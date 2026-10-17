@@ -1,5 +1,7 @@
--- PrisonHub v2.9 | WindUI | Cuộc Sống Trong Nhà Tù
--- Additions: Teleport, Aimlock, FOV Circle, Auto-Shoot (hostile logic + trespassing toggle), Auto-Invisible <35HP
+-- PrisonHub v3.1 | WindUI | Cuộc Sống Trong Nhà Tù
+-- v3.1: tab Players (dropdown chọn người, Ô NHẬP TÊN để chọn/teleport, teleport tới người đã chọn, spectate),
+--       Anti-Arrest (né Guards cầm Handcuffs + khôi phục di chuyển khi bị còng)
+-- v2.9+: Car tab (Car Fly), Auto Arrest, Spin Bot, Bunny Hop, Teleport, Aimlock, Auto-Shoot, Auto-Invisible <35HP
 local CONFIG = {
     Title = "PrisonHub", Author = "vxmpingz_", Folder = "PrisonHub",
     ExpectedPlaceId = 155615604, StatsInterval = 1, KillLogSize = 50, KillLogShown = 12,
@@ -69,7 +71,9 @@ local OverviewTab = Window:Tab({ Title="Overview",  Icon="activity" })
 local CombatTab   = Window:Tab({ Title="Combat",    Icon="sword" })
 local AimTab      = Window:Tab({ Title="Aimlock",   Icon="crosshair" })
 local MovementTab = Window:Tab({ Title="Movement",  Icon="zap" })
+local CarTab      = Window:Tab({ Title="Car",       Icon="car" })
 local TeleportTab = Window:Tab({ Title="Teleport",  Icon="map-pin" })
+local PlayersTab  = Window:Tab({ Title="Players",   Icon="user" })
 local PickupTab   = Window:Tab({ Title="Pickups",   Icon="package" })
 local TeamSwapTab = Window:Tab({ Title="Team Swap", Icon="refresh-cw" })
 local ESPTab      = Window:Tab({ Title="ESP",       Icon="eye" })
@@ -80,7 +84,7 @@ local SettingsTab = Window:Tab({ Title="Settings",  Icon="settings" })
 
 local API = {
     Window=Window, WindUI=WindUI, CONFIG=CONFIG, state=state, notify=notify, track=track, safe=safe, log=log,
-    Tabs={ Overview=OverviewTab, Combat=CombatTab, Aim=AimTab, Movement=MovementTab, Teleport=TeleportTab,
+    Tabs={ Overview=OverviewTab, Combat=CombatTab, Aim=AimTab, Movement=MovementTab, Car=CarTab, Teleport=TeleportTab, Players=PlayersTab,
            Pickups=PickupTab, TeamSwap=TeamSwapTab, ESP=ESPTab, Kills=KillsTab, Teams=TeamsTab, Utility=UtilTab, Settings=SettingsTab }
 }
 if getgenv then getgenv().PrisonHubAPI = API end
@@ -717,6 +721,378 @@ CombatTab:Toggle({ Title="Bắt Trespassing Inmates", Default=true, Callback=fun
 CombatTab:Toggle({ Title="Bắt Hostile Inmates", Default=true, Callback=function(v) arrestCfg.hostile = v end })
 CombatTab:Toggle({ Title="Teleport tới target để bắt", Desc="Tắt = chỉ bắt khi target đã ở gần bạn", Default=true, Callback=function(v) arrestCfg.tp = v end })
 
+-- ===== CAR TAB (Car Fly bằng dịch chuyển + noclip) =====
+do
+    local carCfg = { speed = 80, targetY = 116, flyNoclip = true }
+
+    local function currentSeat()
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        local seat = hum and hum.SeatPart
+        if seat and seat:IsA("VehicleSeat") then return seat end
+    end
+    local function carModel(seat)
+        local m = seat
+        while m.Parent and m.Parent ~= workspace and m.Parent.Name ~= "CarContainer" do m = m.Parent end
+        return m
+    end
+
+    local savedCollide = {}
+    local function disableCollisions(model)
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("BasePart") then
+                if savedCollide[d] == nil then savedCollide[d] = d.CanCollide end
+                d.CanCollide = false
+            end
+        end
+    end
+    local function restoreCollisions()
+        for part, can in pairs(savedCollide) do
+            if part.Parent then part.CanCollide = can end
+        end
+        savedCollide = {}
+    end
+
+    -- vô hiệu BodyGyro/BodyVelocity của game khi bay (tránh giằng co gây xoay loạn)
+    local savedMovers, moverModel = {}, nil
+    local function freezeGameMovers(model)
+        if moverModel == model then return end
+        moverModel = model
+        savedMovers = {}
+        for _, d in ipairs(model:GetDescendants()) do
+            if d:IsA("BodyGyro") then
+                savedMovers[#savedMovers+1] = { d, "MaxTorque", d.MaxTorque }
+                d.MaxTorque = Vector3.zero
+            elseif d:IsA("BodyVelocity") then
+                savedMovers[#savedMovers+1] = { d, "MaxForce", d.MaxForce }
+                d.MaxForce = Vector3.zero
+            end
+        end
+    end
+    local function restoreGameMovers()
+        for _, sv in ipairs(savedMovers) do
+            if sv[1].Parent then pcall(function() sv[1][sv[2]] = sv[3] end) end
+        end
+        savedMovers, moverModel = {}, nil
+    end
+
+    local flyConn, rootsCache, rootsModel = nil, {}, nil
+    local function stopCarFly()
+        if flyConn then flyConn:Disconnect(); flyConn = nil end
+        restoreGameMovers()
+        restoreCollisions()
+        rootsCache, rootsModel = {}, nil
+    end
+    API.stopCarFly = stopCarFly
+
+    local function moveCar(model, center, newCenter, yawStep)
+        -- pivot của model Squad nằm rất xa xe, nên xoay quanh tâm xe rồi áp lên pivot
+        local delta = CFrame.new(newCenter) * CFrame.Angles(0, yawStep, 0) * CFrame.new(-center)
+        model:PivotTo(delta * model:GetPivot())
+    end
+
+    CarTab:Paragraph({ Title="Car Fly", Desc="Ngồi ghế lái rồi bật. Ga tiến + nhìn lên = xe lên, buông ga = lơ lửng. PC: Space lên, Ctrl xuống. Bay bằng dịch chuyển nên không bị tường chặn." })
+    CarTab:Toggle({ Title="Car Fly", Default=false, Callback=function(v)
+        state.carFly = v
+        stopCarFly()
+        if not v then return end
+        flyConn = track(RunService.Heartbeat:Connect(function(dt)
+            local seat = currentSeat()
+            if not seat then return end
+            local model = carModel(seat)
+            freezeGameMovers(model)
+            if carCfg.flyNoclip then disableCollisions(model) end
+
+            local cam = workspace.CurrentCamera
+            local dir = cam.CFrame.LookVector * seat.ThrottleFloat + cam.CFrame.RightVector * seat.SteerFloat
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+            if dir.Magnitude > 1 then dir = dir.Unit end
+
+            local center = seat.Position
+            local newCenter = center + dir * carCfg.speed * dt
+
+            local fwd = Vector3.new(seat.CFrame.LookVector.X, 0, seat.CFrame.LookVector.Z)
+            local des = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+            local yaw = 0
+            if fwd.Magnitude > 0.01 and des.Magnitude > 0.01 then
+                fwd, des = fwd.Unit, des.Unit
+                local ang = math.atan2(fwd:Cross(des).Y, fwd:Dot(des))
+                yaw = ang * math.min(1, 8 * dt)
+            end
+            moveCar(model, center, newCenter, yaw)
+
+            if rootsModel ~= model then
+                rootsModel, rootsCache = model, {}
+                local seen = {}
+                for _, d in ipairs(model:GetDescendants()) do
+                    if d:IsA("BasePart") then
+                        local r = d.AssemblyRootPart
+                        if r and not seen[r] then seen[r] = true; rootsCache[#rootsCache+1] = r end
+                    end
+                end
+            end
+            for _, r in ipairs(rootsCache) do
+                if r.Parent then
+                    r.AssemblyLinearVelocity = Vector3.zero
+                    r.AssemblyAngularVelocity = Vector3.zero
+                end
+            end
+        end))
+    end })
+    CarTab:Slider({ Title="Tốc độ bay", Step=10, Value={ Min=20, Max=300, Default=carCfg.speed }, Callback=function(v) carCfg.speed = v end })
+    CarTab:Toggle({ Title="Fly xuyên tường (tắt va chạm xe)", Default=true, Callback=function(v) carCfg.flyNoclip = v end })
+
+    local function shiftCarY(deltaY, absoluteY)
+        local seat = currentSeat()
+        if not seat then notify("Car", "Bạn chưa ngồi ghế lái") return false end
+        local model = carModel(seat)
+        local dy = absoluteY and (absoluteY - seat.Position.Y) or deltaY
+        model:PivotTo(CFrame.new(0, dy, 0) * model:GetPivot())
+        return true
+    end
+    CarTab:Slider({ Title="Độ cao teleport (Y)", Step=1, Value={ Min=60, Max=300, Default=carCfg.targetY }, Callback=function(v) carCfg.targetY = v end })
+    CarTab:Button({ Title="Teleport xe tới Y đã chọn (mặc định 116)", Callback=function()
+        if shiftCarY(nil, carCfg.targetY) then notify("Car", "Đã đưa xe lên Y = " .. carCfg.targetY) end
+    end })
+    CarTab:Button({ Title="Nâng xe lên +15", Callback=function() shiftCarY(15) end })
+    CarTab:Button({ Title="Hạ xe xuống -15", Callback=function() shiftCarY(-15) end })
+end
+
+-- ===== v3.1: PLAYERS (teleport dropdown + spectate) + ANTI-ARREST =====
+do
+    -- ----- Danh sách người chơi -----
+    local selected, byLabel, labels = nil, {}, {}
+    local dropdown
+    local function labelOf(p)
+        return string.format("%s [%s]", p.Name, p.Team and p.Team.Name or "?")
+    end
+    local function rebuild()
+        byLabel, labels = {}, {}
+        local list = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer then list[#list+1] = p end
+        end
+        table.sort(list, function(a, b) return a.Name:lower() < b.Name:lower() end)
+        for _, p in ipairs(list) do
+            local l = labelOf(p)
+            byLabel[l] = p
+            labels[#labels+1] = l
+        end
+        if selected and not selected.Parent then selected = nil end
+    end
+    rebuild()
+    dropdown = PlayersTab:Dropdown({ Title="Người chơi", Values=labels, Value=labels[1], Callback=function(v)
+        local name = type(v) == "table" and v[1] or v
+        selected = byLabel[name]
+    end })
+    selected = labels[1] and byLabel[labels[1]] or nil
+
+    local function refresh()
+        local prev = selected
+        rebuild()
+        pcall(function() dropdown:Refresh(labels) end)
+        local keep
+        if prev then
+            for l, p in pairs(byLabel) do if p == prev then keep = l end end
+        end
+        if keep then
+            selected = prev
+            pcall(function() dropdown:Select(keep) end)
+        else
+            selected = nil
+        end
+    end
+    local pending = false
+    local function scheduleRefresh()
+        if pending then return end
+        pending = true
+        task.delay(0.6, function() pending = false; refresh() end)
+    end
+    track(Players.PlayerAdded:Connect(scheduleRefresh))
+    track(Players.PlayerRemoving:Connect(scheduleRefresh))
+
+    PlayersTab:Button({ Title="Làm mới danh sách", Callback=refresh })
+
+    local function step(dir)
+        if #labels == 0 then return end
+        local idx = 0
+        if selected then
+            for i, l in ipairs(labels) do if byLabel[l] == selected then idx = i end end
+        end
+        if idx == 0 then idx = (dir > 0) and 0 or 1 end
+        idx = ((idx - 1 + dir) % #labels) + 1
+        selected = byLabel[labels[idx]]
+        pcall(function() dropdown:Select(labels[idx]) end)
+    end
+    PlayersTab:Button({ Title="◀ Người trước", Callback=function() step(-1) end })
+    PlayersTab:Button({ Title="Người kế tiếp ▶", Callback=function() step(1) end })
+
+    -- ----- Nhập tên để chọn / teleport -----
+    local typedName = ""
+    local nameInput
+    local function findPlayerByName(q)
+        q = (q or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+        if q == "" then return nil end
+        local best, bestRank
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer then
+                local n, d = p.Name:lower(), p.DisplayName:lower()
+                local rank
+                if n == q or d == q then rank = 1
+                elseif n:sub(1, #q) == q or d:sub(1, #q) == q then rank = 2
+                elseif n:find(q, 1, true) or d:find(q, 1, true) then rank = 3 end
+                if rank and (not bestRank or rank < bestRank) then best, bestRank = p, rank end
+            end
+        end
+        return best
+    end
+    local function selectPlayer(p)
+        selected = p
+        for l, pl in pairs(byLabel) do
+            if pl == p then pcall(function() dropdown:Select(l) end) break end
+        end
+    end
+    nameInput = PlayersTab:Input({ Title="Nhập tên người chơi", Desc="Gõ tên hoặc một phần tên (Name/DisplayName) rồi Enter. Người đó sẽ được chọn cho Teleport / Spectate", Placeholder="vd: nimanagua", Value="", Callback=function(text)
+        typedName = text or ""
+        if typedName == "" then return end
+        local p = findPlayerByName(typedName)
+        if p then
+            selectPlayer(p)
+            notify("Đã chọn", p.Name .. " (" .. p.DisplayName .. ")")
+        else
+            notify("Không tìm thấy", "Không có người chơi khớp \"" .. typedName .. "\"")
+        end
+    end })
+    local function teleportToTyped()
+        local q = typedName
+        if (q == nil or q == "") and nameInput and nameInput.Value then q = nameInput.Value end
+        local p = findPlayerByName(q)
+        if not p then notify("Teleport", "Không tìm thấy người chơi \"" .. tostring(q) .. "\"") return end
+        local hrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then notify("Teleport", p.Name .. " chưa có nhân vật") return end
+        selectPlayer(p)
+        teleportTo(hrp.Position + Vector3.new(0, 0, 3))
+    end
+    PlayersTab:Button({ Title="Teleport tới tên đã nhập", Callback=teleportToTyped })
+
+    -- ----- Teleport tới người đã chọn -----
+    PlayersTab:Button({ Title="Teleport tới người đã chọn", Callback=function()
+        local p = selected
+        local hrp = p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then notify("Teleport", "Chưa chọn người chơi hoặc họ chưa có nhân vật") return end
+        teleportTo(hrp.Position + Vector3.new(0, 0, 3))
+    end })
+
+    -- ----- Spectate -----
+    local specConn
+    local function stopSpectate()
+        if specConn then specConn:Disconnect(); specConn = nil end
+        local cam = workspace.CurrentCamera
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if cam and hum then cam.CameraSubject = hum end
+    end
+    PlayersTab:Toggle({ Title="Spectate người đã chọn", Desc="Xem camera của người chơi đã chọn; tắt để quay về nhân vật của bạn", Default=false, Callback=function(v)
+        state.spectate = v
+        stopSpectate()
+        if not v then return end
+        if not selected then notify("Spectate", "Hãy chọn người chơi trước") return end
+        specConn = track(RunService.RenderStepped:Connect(function()
+            local p = selected
+            if not p or not p.Parent then stopSpectate() return end
+            local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+            local cam = workspace.CurrentCamera
+            if hum and cam and cam.CameraSubject ~= hum then cam.CameraSubject = hum end
+        end))
+    end })
+
+    -- ----- Anti-Arrest -----
+    local aaCfg = { radius = 25, cooldown = 3, dest = "Roof (Cellblock)", restore = true }
+    local aaConn, lastFlee = nil, 0
+    state.antiArrest = false
+    local destNames = {}
+    for _, loc in ipairs(TELEPORT_LOCATIONS) do destNames[#destNames+1] = loc.name end
+    local function destPos()
+        for _, loc in ipairs(TELEPORT_LOCATIONS) do
+            if loc.name == aaCfg.dest then return loc.pos end
+        end
+    end
+    local function cuffsOut(p)
+        local t = p.Character and p.Character:FindFirstChild("Handcuffs")
+        return t ~= nil and t:IsA("Tool")
+    end
+    -- chỉ né khi mình thực sự có thể bị bắt (Criminals / Hostile / Trespassing)
+    local function atRisk()
+        local c = LocalPlayer.Character
+        if not c then return false end
+        local t = LocalPlayer.Team and LocalPlayer.Team.Name
+        return t == "Criminals" or c:GetAttribute("Hostile") == true or c:GetAttribute("Trespassing") == true
+    end
+    CombatTab:Toggle({ Title="Anti-Arrest (né Guards cầm Handcuffs)", Desc="Khi bạn có thể bị bắt và một Guard đang cầm Handcuffs ở gần, tự teleport tới điểm né", Default=false, Callback=function(v)
+        state.antiArrest = v
+        if aaConn then aaConn:Disconnect(); aaConn = nil end
+        if not v then return end
+        local last = 0
+        aaConn = track(RunService.Heartbeat:Connect(function()
+            if os.clock() - last < 0.1 then return end
+            last = os.clock()
+            if os.clock() - lastFlee < aaCfg.cooldown then return end
+            if (LocalPlayer.Team and LocalPlayer.Team.Name) == "Guards" or not atRisk() then return end
+            local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if not hrp then return end
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Team and p.Team.Name == "Guards" and cuffsOut(p) then
+                    local ghrp = p.Character:FindFirstChild("HumanoidRootPart")
+                    local ghum = p.Character:FindFirstChildOfClass("Humanoid")
+                    if ghrp and ghum and ghum.Health > 0 and (ghrp.Position - hrp.Position).Magnitude <= aaCfg.radius then
+                        local pos = destPos()
+                        if pos then
+                            lastFlee = os.clock()
+                            hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+                            if hoverTargetY then hoverTargetY = pos.Y + 3 end
+                            notify("Anti-Arrest", p.DisplayName .. " cầm Handcuffs, đã né tới " .. aaCfg.dest)
+                        end
+                        break
+                    end
+                end
+            end
+        end))
+    end })
+    CombatTab:Slider({ Title="Anti-Arrest: khoảng cách báo động (stud)", Step=1, Value={ Min=5, Max=100, Default=aaCfg.radius }, Callback=function(v) aaCfg.radius = v end })
+    CombatTab:Dropdown({ Title="Anti-Arrest: điểm né", Values=destNames, Value=aaCfg.dest, Callback=function(v)
+        aaCfg.dest = type(v) == "table" and v[1] or v
+    end })
+
+    -- ----- Khôi phục di chuyển khi bị còng (hiệu ứng phía client) -----
+    local arrestEvt = Remotes and Remotes:FindFirstChild("ClientArrested")
+    local baseSpeed, baseJump, restoreUntil = 16, 7.2, 0
+    local function myHum() return LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") end
+    track(RunService.Heartbeat:Connect(function()
+        local h = myHum()
+        if h and os.clock() > restoreUntil then
+            if h.WalkSpeed > 0.5 then baseSpeed = h.WalkSpeed end
+            if h.JumpHeight > 0.5 then baseJump = h.JumpHeight end
+        end
+    end))
+    if arrestEvt then
+        track(arrestEvt.OnClientEvent:Connect(function()
+            if not aaCfg.restore then return end
+            restoreUntil = os.clock() + 20
+            notify("Anti-Arrest", "Bị còng, đang khôi phục di chuyển")
+        end))
+    end
+    track(RunService.Stepped:Connect(function()
+        if not aaCfg.restore or os.clock() > restoreUntil then return end
+        local h = myHum()
+        if not h or h.Health <= 0 then return end
+        if h.WalkSpeed < baseSpeed then h.WalkSpeed = baseSpeed end
+        if h.JumpHeight < baseJump then h.JumpHeight = baseJump end
+        LocalPlayer:SetAttribute("BackpackEnabled", true)
+    end))
+    CombatTab:Toggle({ Title="Khôi phục di chuyển khi bị còng", Desc="Client-only: trả lại WalkSpeed/Jump/Backpack. Server vẫn có thể giữ trạng thái bị bắt", Default=true, Callback=function(v) aaCfg.restore = v end })
+
+    API.stopSpectate = stopSpectate
+end
+
 -- ===== SPIN BOT + BUNNY HOP =====
 local spinSpeed, spinConn, bhopConn = 720, nil, nil
 state.spin, state.bhop = false, false
@@ -754,7 +1130,7 @@ MovementTab:Toggle({ Title="Bunny Hop", Desc="Tự nhảy liên tục khi đang 
         end
     end))
 end })
-API.cleanupMisc = function() stopSpin(); stopBhop() end
+API.cleanupMisc = function() stopSpin(); stopBhop(); if API.stopCarFly then API.stopCarFly() end; if API.stopSpectate then API.stopSpectate() end end
 
 track(LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.6)
@@ -1102,5 +1478,5 @@ task.spawn(function()
     end
 end)
 
-notify("PrisonHub","v2.9 Loaded ✓")
-log("INFO","PrisonHub v2.9 ready")
+notify("PrisonHub","v3.1 Loaded ✓")
+log("INFO","PrisonHub v3.1 ready")
