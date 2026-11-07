@@ -1,4 +1,6 @@
--- PrisonHub v3.1 | WindUI | Cuộc Sống Trong Nhà Tù
+-- PrisonHub v3.2 | WindUI | Cuộc Sống Trong Nhà Tù
+-- v3.2: Arrest Aura (không teleport), Auto Arrest tự dùng Taser bắn Hostile Inmates rồi bắt ngay
+--       (Hostile Inmates chỉ bắt được khi có attribute "Tased" - xác nhận từ HandcuffsClient)
 -- v3.1: tab Players (dropdown chọn người, Ô NHẬP TÊN để chọn/teleport, teleport tới người đã chọn, spectate),
 --       Anti-Arrest (né Guards cầm Handcuffs + khôi phục di chuyển khi bị còng)
 -- v2.9+: Car tab (Car Fly), Auto Arrest, Spin Bot, Bunny Hop, Teleport, Aimlock, Auto-Shoot, Auto-Invisible <35HP
@@ -643,83 +645,207 @@ MovementTab:Slider({ Title="Hover Speed", Step=5, Value={ Min=10, Max=100, Defau
 MovementTab:Button({ Title="Hover Up +5",   Callback=function() if hoverTargetY then hoverTargetY += 5 end end })
 MovementTab:Button({ Title="Hover Down -5", Callback=function() if hoverTargetY then hoverTargetY -= 5 end end })
 
--- ===== AUTO ARREST (Guards + Handcuffs) =====
+-- ===== ARREST ENGINE: AUTO ARREST + ARREST AURA + TASER (v3.2) =====
+-- Quy tắc bắt, xác nhận từ HandcuffsClient / GunController / ToolProperties.Taser:
+--   * Criminals               → bắt thẳng
+--   * Inmates + Hostile       → CHỈ bắt được khi character có attribute "Tased" (đây là lý do trước đây không bắt được)
+--   * Inmates + Trespassing   → bắt thẳng (khi không Hostile)
+--   * Mục tiêu có ForceField  → không bắt được. Tầm với của còng ≈ 7.5 stud
+--   * Taser: 1 viên, reload 3.4s (GunRemotes.FuncReload:InvokeServer()), tầm 52 stud
+--   * Bắn:   ShootEvent:FireServer({ { headPos, hitPos, hitPart } })
 local arrestRemote = Remotes and Remotes:FindFirstChild("ArrestPlayer")
-local arrestCfg = { radius=100, interval=0.4, cooldown=2.5, criminals=true, trespass=true, hostile=true, tp=true }
-local arrestConn, arrestBusy, arrestedAt = nil, false, {}
-state.autoArrest = false
-local function wantArrest(p)
-    if p == LocalPlayer or not p.Team or not p.Character then return false end
-    local hum = p.Character:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return false end
-    local t = p.Team.Name
-    if t == "Criminals" then return arrestCfg.criminals end
-    if t == "Inmates" then
-        if arrestCfg.trespass and p.Character:GetAttribute("Trespassing") == true then return true end
-        if arrestCfg.hostile and p.Character:GetAttribute("Hostile") == true then return true end
-    end
-    return false
+local reloadRemote = GunRemotes and GunRemotes:FindFirstChild("FuncReload")
+local ARREST_REACH, TASER_RANGE, TASER_RELOAD = 7, 45, 3.4
+local arrestCfg = { radius=100, cooldown=2.5, criminals=true, trespass=true, hostile=true, tp=true, useTaser=true, auraRange=7 }
+local arrestBusy, arrestedAt, lastTased = false, {}, {}
+local taserReadyAt = 0
+state.autoArrest, state.arrestAura = false, false
+local arrestConn, auraConn
+
+local losParams = RaycastParams.new()
+losParams.FilterType = Enum.RaycastFilterType.Exclude
+local function hasLOS(fromPos, targetChar)
+    local hrp = targetChar and targetChar:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    losParams.FilterDescendantsInstances = { LocalPlayer.Character, targetChar }
+    return workspace:Raycast(fromPos, hrp.Position - fromPos, losParams) == nil
 end
-local function getCuffs()
+local function findTool(name)
     local c = LocalPlayer.Character
-    if not c then return nil end
-    for _, box in ipairs({ c, LocalPlayer.Backpack }) do
-        local t = box:FindFirstChild("Handcuffs")
-        if t and t:IsA("Tool") then return t end
-    end
+    local t = (c and c:FindFirstChild(name)) or LocalPlayer.Backpack:FindFirstChild(name)
+    if t and t:IsA("Tool") then return t end
 end
+local function equipTool(tool, hum)
+    if tool.Parent ~= LocalPlayer.Character then
+        hum:EquipTool(tool)
+        local t0 = os.clock()
+        while tool.Parent ~= LocalPlayer.Character and os.clock() - t0 < 0.6 do task.wait(0.03) end
+        task.wait(0.12)
+    end
+    return tool.Parent == LocalPlayer.Character
+end
+local function setPos(root, cf)
+    root.CFrame = cf
+    if hoverTargetY then hoverTargetY = cf.Position.Y end
+end
+
+-- "ready"    = bắt được ngay
+-- "needTase" = Hostile Inmate chưa bị Tased, phải bắn Taser trước
+local function arrestState(p)
+    if p == LocalPlayer or not p.Team then return nil end
+    local c = p.Character
+    local h = c and c:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 or c:FindFirstChildOfClass("ForceField") then return nil end
+    local t = p.Team.Name
+    if t == "Criminals" then return arrestCfg.criminals and "ready" or nil end
+    if t == "Inmates" then
+        if c:GetAttribute("Hostile") == true then
+            if not arrestCfg.hostile then return nil end
+            if c:GetAttribute("Tased") then return "ready" end
+            return "needTase"
+        elseif arrestCfg.trespass and c:GetAttribute("Trespassing") == true then
+            return "ready"
+        end
+    end
+    return nil
+end
+
+-- Bắn Taser vào p, đợi server đặt attribute Tased. Trả về true nếu thật sự đã Tased.
+local function taseTarget(p, hum)
+    local tool = findTool("Taser")
+    local c = p.Character
+    local aim = c and c:FindFirstChild("HumanoidRootPart")
+    local myChar = LocalPlayer.Character
+    local origin = myChar and (myChar:FindFirstChild("Head") or myChar:FindFirstChild("HumanoidRootPart"))
+    if not (tool and shootEvent and aim and origin) then return false end
+    if not equipTool(tool, hum) then return false end
+    lastTased[p] = os.clock()
+    shootEvent:FireServer({ { origin.Position, aim.Position, aim } })
+    taserReadyAt = os.clock() + TASER_RELOAD + 0.3
+    if reloadRemote then task.spawn(function() pcall(function() reloadRemote:InvokeServer() end) end) end
+    local t0 = os.clock()
+    while os.clock() - t0 < 1.2 do
+        if c:GetAttribute("Tased") then return true end
+        task.wait(0.05)
+    end
+    return c:GetAttribute("Tased") == true
+end
+
+-- opts = { tp=bool, reach=studs, radius=studs }
+local function pickTarget(opts)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local now = os.clock()
+    local haveTaser = arrestCfg.useTaser and shootEvent ~= nil and now >= taserReadyAt and findTool("Taser") ~= nil
+    local best, bestSt, bestD, bestPrio
+    for _, p in ipairs(Players:GetPlayers()) do
+        local st = arrestState(p)
+        local hrp = st and p.Character:FindFirstChild("HumanoidRootPart")
+        if hrp and (not arrestedAt[p] or now - arrestedAt[p] > arrestCfg.cooldown) then
+            local d = (hrp.Position - root.Position).Magnitude
+            local ok
+            if st == "ready" then
+                ok = d <= (opts.tp and opts.radius or opts.reach)
+            else
+                ok = haveTaser and (not lastTased[p] or now - lastTased[p] > 4)
+                if ok then
+                    if opts.tp then ok = d <= opts.radius
+                    else ok = d <= TASER_RANGE and hasLOS(root.Position, p.Character) end
+                end
+            end
+            if ok then
+                local prio = (st == "ready") and 0 or 1
+                if not best or prio < bestPrio or (prio == bestPrio and d < bestD) then
+                    best, bestSt, bestD, bestPrio = p, st, d, prio
+                end
+            end
+        end
+    end
+    return best, bestSt
+end
+
+local function engage(p, st, opts)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not (root and hum and p.Character) then return false end
+    local home = root.CFrame
+    local function snap()
+        local t = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+        if t and root.Parent then setPos(root, t.CFrame * CFrame.new(0, 0, 3)); task.wait(0.12) end
+    end
+    local function goHome()
+        if opts.tp and root.Parent and LocalPlayer.Character == char then setPos(root, home) end
+    end
+    arrestedAt[p] = os.clock()
+    if st == "needTase" then
+        if opts.tp then snap() end
+        if not taseTarget(p, hum) then
+            log("WARN", "Taser không làm " .. p.Name .. " bị Tased")
+            goHome() return false
+        end
+    end
+    local cuffs = findTool("Handcuffs")
+    if not cuffs or not equipTool(cuffs, hum) then goHome() return false end
+    if opts.tp then snap() end
+    local t = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+    if not t or (t.Position - root.Position).Magnitude > opts.reach + 0.5 then goHome() return false end
+    if p.Character:FindFirstChildOfClass("ForceField") then goHome() return false end
+    local ok, res = pcall(function() return arrestRemote:InvokeServer(p, 1) end)
+    task.wait(0.1)
+    goHome()
+    if ok and res then notify("✓ Arrest", p.DisplayName .. " (" .. (p.Team and p.Team.Name or "?") .. ")") end
+    return ok and res
+end
+
+local function startArrestLoop(interval, optsFn)
+    local last = 0
+    return track(RunService.Heartbeat:Connect(function()
+        if not running or arrestBusy or os.clock() - last < interval then return end
+        last = os.clock()
+        if not (LocalPlayer.Team and LocalPlayer.Team.Name == "Guards") then return end
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 or not findTool("Handcuffs") then return end
+        local opts = optsFn()
+        local p, st = pickTarget(opts)
+        if not p then return end
+        arrestBusy = true
+        task.spawn(function()
+            local ok, err = pcall(engage, p, st, opts)
+            if not ok then log("ERROR", "arrest: " .. tostring(err)) end
+            arrestBusy = false
+        end)
+    end))
+end
+
 divider(CombatTab)
-CombatTab:Toggle({ Title="Auto Arrest (Guards)", Desc="Guards tự bắt Criminals / Hostile / Trespassing Inmates bằng Handcuffs", Default=false, Callback=function(v)
+CombatTab:Paragraph({ Title="Arrest (Guards)", Desc="Cần Handcuffs. Hostile Inmates sẽ được bắn Taser trước (cần có Taser trong Backpack), đợi server xác nhận Tased rồi mới bắt." })
+CombatTab:Toggle({ Title="Auto Arrest (Guards)", Desc="Tự tìm target trong phạm vi, teleport tới, Taser (nếu là Hostile Inmate) rồi bắt, sau đó về chỗ cũ", Default=false, Callback=function(v)
     state.autoArrest = v
     if arrestConn then arrestConn:Disconnect(); arrestConn = nil end
     if not v then return end
     if not arrestRemote then notify("Auto Arrest", "Không thấy ArrestPlayer") return end
-    local last = 0
-    arrestConn = track(RunService.Heartbeat:Connect(function()
-        if arrestBusy or os.clock() - last < arrestCfg.interval then return end
-        last = os.clock()
-        if not (LocalPlayer.Team and LocalPlayer.Team.Name == "Guards") then return end
-        local char = LocalPlayer.Character
-        local myHRP = char and char:FindFirstChild("HumanoidRootPart")
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if not myHRP or not hum or hum.Health <= 0 then return end
-        local best, bestHRP, bestD = nil, nil, arrestCfg.radius
-        for _, p in ipairs(Players:GetPlayers()) do
-            if wantArrest(p) and (not arrestedAt[p] or os.clock() - arrestedAt[p] > arrestCfg.cooldown) then
-                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local d = (hrp.Position - myHRP.Position).Magnitude
-                    if d <= bestD then best, bestHRP, bestD = p, hrp, d end
-                end
-            end
-        end
-        if not best then return end
-        local cuffs = getCuffs()
-        if not cuffs then return end
-        arrestBusy = true
-        task.spawn(function()
-            pcall(function()
-                if cuffs.Parent ~= char then hum:EquipTool(cuffs); task.wait(0.15) end
-                local home
-                if arrestCfg.tp then
-                    home = myHRP.CFrame
-                    myHRP.CFrame = bestHRP.CFrame * CFrame.new(0, 0, 3)
-                    task.wait(0.2)
-                end
-                arrestedAt[best] = os.clock()
-                arrestRemote:InvokeServer(best, 1)
-                task.wait(0.1)
-                if home and myHRP.Parent then myHRP.CFrame = home end
-            end)
-            arrestBusy = false
-        end)
-    end))
+    arrestConn = startArrestLoop(0.4, function()
+        return { tp = arrestCfg.tp, reach = ARREST_REACH, radius = arrestCfg.radius }
+    end)
 end })
-CombatTab:Slider({ Title="Phạm vi quét target (stud)", Step=5, Value={ Min=5, Max=500, Default=arrestCfg.radius }, Callback=function(v) arrestCfg.radius = v end })
+CombatTab:Toggle({ Title="Arrest Aura (Guards)", Desc="Tự bắt mọi target hợp lệ trong tầm còng, KHÔNG teleport. Hostile Inmates trong 45 stud (có line-of-sight) sẽ được Taser", Default=false, Callback=function(v)
+    state.arrestAura = v
+    if auraConn then auraConn:Disconnect(); auraConn = nil end
+    if not v then return end
+    if not arrestRemote then notify("Arrest Aura", "Không thấy ArrestPlayer") return end
+    auraConn = startArrestLoop(0.15, function()
+        return { tp = false, reach = arrestCfg.auraRange, radius = arrestCfg.auraRange }
+    end)
+end })
+CombatTab:Slider({ Title="Arrest Aura: tầm bắt (stud)", Desc="Tầm còng gốc ≈ 7.5, đặt cao hơn có thể bị server từ chối", Step=1, Value={ Min=3, Max=12, Default=arrestCfg.auraRange }, Callback=function(v) arrestCfg.auraRange = v end })
+CombatTab:Slider({ Title="Auto Arrest: phạm vi quét (stud)", Step=5, Value={ Min=5, Max=500, Default=arrestCfg.radius }, Callback=function(v) arrestCfg.radius = v end })
+CombatTab:Toggle({ Title="Dùng Taser cho Hostile Inmates", Desc="Tắt = bỏ qua Hostile Inmates chưa bị Tased (vì không bắt được)", Default=true, Callback=function(v) arrestCfg.useTaser = v end })
 CombatTab:Toggle({ Title="Bắt Criminals", Default=true, Callback=function(v) arrestCfg.criminals = v end })
 CombatTab:Toggle({ Title="Bắt Trespassing Inmates", Default=true, Callback=function(v) arrestCfg.trespass = v end })
 CombatTab:Toggle({ Title="Bắt Hostile Inmates", Default=true, Callback=function(v) arrestCfg.hostile = v end })
-CombatTab:Toggle({ Title="Teleport tới target để bắt", Desc="Tắt = chỉ bắt khi target đã ở gần bạn", Default=true, Callback=function(v) arrestCfg.tp = v end })
+CombatTab:Toggle({ Title="Teleport tới target để bắt (Auto Arrest)", Desc="Tắt = chỉ bắt khi target đã ở gần bạn", Default=true, Callback=function(v) arrestCfg.tp = v end })
 
 -- ===== CAR TAB (Car Fly bằng dịch chuyển + noclip) =====
 do
@@ -1448,6 +1574,8 @@ local function unload()
     if autoShootConn then autoShootConn:Disconnect(); autoShootConn=nil end
     if aimlockConn   then aimlockConn:Disconnect();   aimlockConn=nil end
     if autoInvisConn then autoInvisConn:Disconnect(); autoInvisConn=nil end
+    if arrestConn    then arrestConn:Disconnect();    arrestConn=nil end
+    if auraConn      then auraConn:Disconnect();      auraConn=nil end
     for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     connections = {}
     pcall(function()
@@ -1478,5 +1606,5 @@ task.spawn(function()
     end
 end)
 
-notify("PrisonHub","v3.1 Loaded ✓")
-log("INFO","PrisonHub v3.1 ready")
+notify("PrisonHub","v3.2 Loaded ✓")
+log("INFO","PrisonHub v3.2 ready")
