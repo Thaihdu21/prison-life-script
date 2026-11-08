@@ -1,4 +1,5 @@
--- PrisonHub v3.2 | WindUI | Cuộc Sống Trong Nhà Tù
+-- PrisonHub v3.3 | WindUI | Cuộc Sống Trong Nhà Tù
+-- v3.3: Server Hop + Rejoin (tab Utility), Auto Arrest/Aura tự Taser cả Criminals và Trespassing Inmates trước khi bắt
 -- v3.2: Arrest Aura (không teleport), Auto Arrest tự dùng Taser bắn Hostile Inmates rồi bắt ngay
 --       (Hostile Inmates chỉ bắt được khi có attribute "Tased" - xác nhận từ HandcuffsClient)
 -- v3.1: tab Players (dropdown chọn người, Ô NHẬP TÊN để chọn/teleport, teleport tới người đã chọn, spectate),
@@ -26,6 +27,8 @@ local Stats         = game:GetService("Stats")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualUser   = game:GetService("VirtualUser")
 local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = workspace.CurrentCamera
@@ -656,7 +659,7 @@ MovementTab:Button({ Title="Hover Down -5", Callback=function() if hoverTargetY 
 local arrestRemote = Remotes and Remotes:FindFirstChild("ArrestPlayer")
 local reloadRemote = GunRemotes and GunRemotes:FindFirstChild("FuncReload")
 local ARREST_REACH, TASER_RANGE, TASER_RELOAD = 7, 45, 3.4
-local arrestCfg = { radius=100, cooldown=2.5, criminals=true, trespass=true, hostile=true, tp=true, useTaser=true, auraRange=7 }
+local arrestCfg = { radius=100, cooldown=2.5, criminals=true, trespass=true, hostile=true, tp=true, useTaser=true, auraRange=7, taseCriminals=true, taseTrespass=true }
 local arrestBusy, arrestedAt, lastTased = false, {}, {}
 local taserReadyAt = 0
 state.autoArrest, state.arrestAura = false, false
@@ -710,6 +713,14 @@ local function arrestState(p)
     return nil
 end
 
+-- Có nên Taser trước khi bắt không (Hostile Inmates luôn phải Taser, còn lại theo toggle)
+local function wantsPreTase(p)
+    local t = p.Team and p.Team.Name
+    if t == "Criminals" then return arrestCfg.taseCriminals end
+    if t == "Inmates" then return arrestCfg.taseTrespass end
+    return false
+end
+
 -- Bắn Taser vào p, đợi server đặt attribute Tased. Trả về true nếu thật sự đã Tased.
 local function taseTarget(p, hum)
     local tool = findTool("Taser")
@@ -744,15 +755,18 @@ local function pickTarget(opts)
         local hrp = st and p.Character:FindFirstChild("HumanoidRootPart")
         if hrp and (not arrestedAt[p] or now - arrestedAt[p] > arrestCfg.cooldown) then
             local d = (hrp.Position - root.Position).Magnitude
+            local taseOk = false
+            if haveTaser and not p.Character:GetAttribute("Tased") and (not lastTased[p] or now - lastTased[p] > 4) then
+                if opts.tp then taseOk = d <= opts.radius
+                else taseOk = d <= TASER_RANGE and hasLOS(root.Position, p.Character) end
+            end
             local ok
-            if st == "ready" then
-                ok = d <= (opts.tp and opts.radius or opts.reach)
+            if st == "needTase" then
+                ok = taseOk
+            elseif taseOk and wantsPreTase(p) then
+                st, ok = "needTase", true
             else
-                ok = haveTaser and (not lastTased[p] or now - lastTased[p] > 4)
-                if ok then
-                    if opts.tp then ok = d <= opts.radius
-                    else ok = d <= TASER_RANGE and hasLOS(root.Position, p.Character) end
-                end
+                ok = d <= (opts.tp and opts.radius or opts.reach)
             end
             if ok then
                 local prio = (st == "ready") and 0 or 1
@@ -781,9 +795,10 @@ local function engage(p, st, opts)
     arrestedAt[p] = os.clock()
     if st == "needTase" then
         if opts.tp then snap() end
+        local hard = p.Character:GetAttribute("Hostile") == true -- Hostile Inmate bắt buộc phải Tased
         if not taseTarget(p, hum) then
-            log("WARN", "Taser không làm " .. p.Name .. " bị Tased")
-            goHome() return false
+            log("WARN", "Taser không làm " .. p.Name .. " bị Tased" .. (hard and "" or " (bắt thẳng)"))
+            if hard then goHome() return false end
         end
     end
     local cuffs = findTool("Handcuffs")
@@ -842,6 +857,8 @@ end })
 CombatTab:Slider({ Title="Arrest Aura: tầm bắt (stud)", Desc="Tầm còng gốc ≈ 7.5, đặt cao hơn có thể bị server từ chối", Step=1, Value={ Min=3, Max=12, Default=arrestCfg.auraRange }, Callback=function(v) arrestCfg.auraRange = v end })
 CombatTab:Slider({ Title="Auto Arrest: phạm vi quét (stud)", Step=5, Value={ Min=5, Max=500, Default=arrestCfg.radius }, Callback=function(v) arrestCfg.radius = v end })
 CombatTab:Toggle({ Title="Dùng Taser cho Hostile Inmates", Desc="Tắt = bỏ qua Hostile Inmates chưa bị Tased (vì không bắt được)", Default=true, Callback=function(v) arrestCfg.useTaser = v end })
+CombatTab:Toggle({ Title="Taser Criminals trước khi bắt", Desc="Bật = bắn Taser rồi mới bắt. Taser đang reload / bắn không trúng thì bắt thẳng", Default=true, Callback=function(v) arrestCfg.taseCriminals = v end })
+CombatTab:Toggle({ Title="Taser Trespassing Inmates trước khi bắt", Desc="Giống trên, áp dụng cho Inmates đang Trespassing", Default=true, Callback=function(v) arrestCfg.taseTrespass = v end })
 CombatTab:Toggle({ Title="Bắt Criminals", Default=true, Callback=function(v) arrestCfg.criminals = v end })
 CombatTab:Toggle({ Title="Bắt Trespassing Inmates", Default=true, Callback=function(v) arrestCfg.trespass = v end })
 CombatTab:Toggle({ Title="Bắt Hostile Inmates", Default=true, Callback=function(v) arrestCfg.hostile = v end })
@@ -1562,6 +1579,93 @@ end })
 UtilTab:Slider({ Title="Field of View", Step=1, Value={ Min=40, Max=120, Default=originals.fov }, Callback=function(v) safe("fov", function() Camera.FieldOfView=v end) end })
 UtilTab:Toggle({ Title="Unlock Max Zoom", Default=false, Callback=function(v) safe("zoom", function() LocalPlayer.CameraMaxZoomDistance=v and 1000 or originals.zoom end) end })
 
+-- ===== SERVER HOP + REJOIN (v3.3) =====
+do
+    UtilTab:Paragraph({ Title="Server", Desc="Rejoin = vào lại đúng server này. Hop = sang server public khác (không đầy, không phải server hiện tại)." })
+    local hopping = false
+    local function httpGet(url)
+        local ok, res = pcall(function() return game:HttpGet(url) end)
+        if ok and res then return res end
+        local req = (syn and syn.request) or http_request or request
+        if req then
+            local ok2, r = pcall(req, { Url = url, Method = "GET" })
+            if ok2 and r and r.Body then return r.Body end
+        end
+        return nil
+    end
+    local function listServers(maxPages)
+        local out, cursor = {}, nil
+        for _ = 1, maxPages do
+            local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100%s", game.PlaceId, cursor and ("&cursor=" .. cursor) or "")
+            local body = httpGet(url)
+            if not body then break end
+            local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+            if not ok or type(data) ~= "table" or type(data.data) ~= "table" then break end
+            for _, sv in ipairs(data.data) do
+                if sv.id ~= game.JobId and type(sv.playing) == "number" and type(sv.maxPlayers) == "number" and sv.playing < sv.maxPlayers - 1 then
+                    out[#out+1] = sv
+                end
+            end
+            cursor = data.nextPageCursor
+            if not cursor then break end
+        end
+        return out
+    end
+    local function visited()
+        if not getgenv then return {} end
+        local g = getgenv()
+        g.PrisonHubVisited = g.PrisonHubVisited or {}
+        return g.PrisonHubVisited
+    end
+    local function hop(mode)
+        if hopping then notify("Server Hop", "Đang tìm server, chờ chút") return end
+        hopping = true
+        task.spawn(function()
+            local list = listServers(3)
+            local seenIds = visited()
+            seenIds[game.JobId] = true
+            local fresh = {}
+            for _, sv in ipairs(list) do if not seenIds[sv.id] then fresh[#fresh+1] = sv end end
+            if #fresh == 0 then fresh = list end -- hết server mới thì cho phép quay lại server cũ
+            if #fresh == 0 then
+                notify("Server Hop", "Không tìm thấy server phù hợp")
+                hopping = false
+                return
+            end
+            local pick
+            if mode == "least" then
+                table.sort(fresh, function(a, b) return a.playing < b.playing end)
+                pick = fresh[1]
+            else
+                pick = fresh[math.random(1, #fresh)]
+            end
+            seenIds[pick.id] = true
+            notify("Server Hop", string.format("Đang sang server %d/%d người...", pick.playing, pick.maxPlayers))
+            local ok, err = pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, pick.id, LocalPlayer) end)
+            if not ok then notify("Server Hop", "Lỗi: " .. tostring(err)) end
+            task.delay(15, function() hopping = false end) -- nếu teleport thất bại thì cho thử lại
+        end)
+    end
+    local function rejoin()
+        notify("Rejoin", "Đang vào lại server...")
+        local ok, err = pcall(function()
+            if #Players:GetPlayers() <= 1 then
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            else
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+            end
+        end)
+        if not ok then notify("Rejoin", "Lỗi: " .. tostring(err)) end
+    end
+    track(TeleportService.TeleportInitFailed:Connect(function(_, result, msg)
+        hopping = false
+        notify("Teleport thất bại", tostring(result) .. " " .. tostring(msg or ""))
+    end))
+    UtilTab:Button({ Title="Rejoin Server", Desc="Vào lại đúng server hiện tại (server trống thì vào server mới)", Callback=rejoin })
+    UtilTab:Button({ Title="Server Hop (ngẫu nhiên)", Desc="Sang một server public khác, ưu tiên server chưa từng ghé", Callback=function() hop("random") end })
+    UtilTab:Button({ Title="Server Hop (ít người nhất)", Desc="Sang server public vắng nhất còn chỗ", Callback=function() hop("least") end })
+end
+
 -- ===== SETTINGS =====
 local function unload()
     running = false
@@ -1606,5 +1710,5 @@ task.spawn(function()
     end
 end)
 
-notify("PrisonHub","v3.2 Loaded ✓")
-log("INFO","PrisonHub v3.2 ready")
+notify("PrisonHub","v3.3 Loaded ✓")
+log("INFO","PrisonHub v3.3 ready")
